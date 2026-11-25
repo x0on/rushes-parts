@@ -18,8 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { chip: arm64,  runner: macos-14, target: '11.0' }
-          - { chip: x86_64, runner: macos-13, target: '10.15' }
+          - { chip: arm64,  runner: macos-latest, target: '11.0' }
+          - { chip: x86_64, runner: macos-15-intel, target: '10.15' }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
