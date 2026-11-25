@@ -1,0 +1,110 @@
+# PHP for the Mac (the php command Rushes runs its pages with), from php.net's own source, with only what Rushes
+# uses built in. Compiled by static-php-cli, run here. See README.md.
+name: php
+on:
+  push:
+    tags: ['php-*']
+    branches: ['try-php*']          # a trial: built and tested, kept as an artifact, not published
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  PHP: '8.5.13'
+  SPC: '2.8.5'                      # static-php-cli, the tool that compiles it
+  # What Rushes' pages use, and nothing else (sqlite3: the catalogue; mbstring: names in every alphabet; zip: a
+  # pull as a zip; session, filter, ctype: sign-in and checks). Each one fewer is a library less to keep patched.
+  EXT: 'sqlite3,mbstring,ctype,session,filter,zip,zlib,opcache'
+  RUSHES: main                      # the Rushes its own checks are run against, with this PHP
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { chip: arm64,  spc: aarch64, runner: macos-latest }
+          - { chip: x86_64, spc: x86_64,  runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: static-php-cli, the tool that compiles PHP
+        run: |
+          curl -fsSL -o spc.tgz https://github.com/crazywhalecc/static-php-cli/releases/download/$SPC/spc-macos-${{ matrix.spc }}.tar.gz
+          shasum -a 256 spc.tgz | tee spc.sha256
+          tar xzf spc.tgz && chmod +x spc && ./spc --version
+          ./spc doctor --auto-fix
+      - name: PHP's source, from php.net, checked against the fingerprint php.net publishes
+        env: { GITHUB_TOKEN: '${{ github.token }}' }
+        run: |
+          ./spc download --with-php=$PHP --for-extensions="$EXT" --prefer-pre-built
+          ls -la downloads | head -40
+          src=$(ls downloads/php-$PHP.tar.* | head -1); test -n "$src"
+          have=$(shasum -a 256 "$src" | cut -d' ' -f1)
+          curl -fsSL "https://www.php.net/releases/index.php?json&version=$PHP" -o php-release.json
+          python3 -c "import json,sys; d=json.load(open('php-release.json')); want=[s.get('sha256') for s in d['source']]; print('php.net says', want); sys.exit(0 if sys.argv[1] in want else 'the source is not the one php.net publishes: not used')" "$have"
+          echo "$have  $(basename $src)" | tee source.sha256
+      - name: Compile PHP
+        run: |
+          ./spc build "$EXT" --build-cli
+          ls -la buildroot/bin
+      - name: Is it the PHP Rushes needs?
+        run: |
+          P=$PWD/buildroot/bin/php
+          $P -v | head -1 | grep -q "PHP $PHP "
+          $P -m | tee modules.txt
+          for m in sqlite3 mbstring ctype session filter zip zlib json hash pcre random; do grep -qi "^$m$" modules.txt || { echo "missing: $m"; exit 1; }; done
+          for m in gmp iconv curl openssl pgsql redis gd; do grep -qi "^$m$" modules.txt && { echo "should not be in: $m"; exit 1; }; done
+          otool -L $P | tee libs.txt; grep -v "/usr/lib/\|/System/Library/\|php:" libs.txt | grep . && { echo "it needs a library the Mac does not have"; exit 1; }
+          $P -r '$d = new SQLite3(":memory:"); $d->exec("create table t (x)"); $d->createFunction("w", fn($a) => mb_strtolower($a)); echo $d->querySingle("select w(\"NIÑO\")"), " ", SQLite3::version()["versionString"], "\n";
+                 $z = new ZipArchive(); $f = tempnam(sys_get_temp_dir(), "z"); $z->open($f, ZipArchive::OVERWRITE); $z->addFromString("a.txt", "a"); $z->close(); echo filesize($f) > 20 ? "zip ok\n" : exit(1);
+                 echo password_verify("x", password_hash("x", PASSWORD_DEFAULT)) ? "password ok\n" : exit(1); echo filter_var("a@b.org", FILTER_VALIDATE_EMAIL) ? "filter ok\n" : exit(1);
+                 echo preg_match("/(*UCP)\\bniño\\b/u", "un niño") ? "words in every alphabet ok\n" : exit(1);'
+          $P -i > php-info.txt
+          # Rushes' own checks, on this PHP: its pages, the Viewer's agreement with Search, pulls and requests, pairing
+          git clone -q --depth 1 --branch $RUSHES https://github.com/x0on/rushes
+          cd rushes/tests && export PHPBIN=$P PATH="$(dirname $P):$PATH"
+          php -v | head -1
+          php test_pages.php | tail -3; php test_pages.php | grep -q FAIL && exit 1
+          php test_password.php | tail -1
+          bash test_viewer.sh | tail -4
+          bash test_pair.sh | tail -2
+          bash test_router.sh | tail -2
+      - name: Pack it, with its fingerprints, its licenses and what went into it
+        run: |
+          mkdir -p out/LICENSES && cd out
+          cp ../buildroot/bin/php php && codesign -s - -f php && tar czf php-$PHP-cli-macos-${{ matrix.spc }}.tar.gz php && rm php
+          cp ../php-info.txt php-$PHP-macos-${{ matrix.chip }}-info.txt
+          ./../spc dump-license --for-extensions="$EXT" --dump-dir=LICENSES --without-php 2>/dev/null || true
+          cp ../source/php-src/LICENSE LICENSES/PHP.txt 2>/dev/null || true
+          ls LICENSES
+          python3 - <<PY
+          import json, hashlib, os, re
+          sha = lambda f: hashlib.sha256(open(f, "rb").read()).hexdigest()
+          info = open("../php-info.txt", errors="replace").read()
+          v = lambda pat: (re.search(pat, info) or [None, ""])[1]
+          libs = [("SQLite", v(r"SQLite Library => (\S+)"), "blessing"), ("zlib", v(r"Compiled Version => (\S+)"), "Zlib"), ("libzip", v(r"[Ll]ibzip.*version => (\S+)"), "BSD-3-Clause"),
+                  ("PCRE2", v(r"PCRE Library Version => (\S+)"), "BSD-3-Clause"), ("Oniguruma", v(r"oniguruma\) version => (\S+)"), "BSD-2-Clause")]
+          parts = {"made": "PHP $PHP for macOS ${{ matrix.chip }}, by github.com/x0on/rushes-parts (${{ github.sha }})", "license": "PHP-3.01", "extensions": "$EXT".split(","),
+                   "parts": [{"name": "PHP", "version": "$PHP", "license": "PHP-3.01", "url": "https://www.php.net/distributions/", "sha256": open("../source.sha256").read().split()[0]},
+                             {"name": "static-php-cli", "version": "$SPC", "license": "MIT", "url": "https://github.com/crazywhalecc/static-php-cli", "sha256": open("../spc.sha256").read().split()[0], "note": "the tool that compiled it"}]
+                            + [{"name": n, "version": ver, "license": lic, "inside": "PHP"} for n, ver, lic in libs if ver],
+                   "sources": sorted(os.listdir("../downloads")),
+                   "files": {f: sha(f) for f in sorted(os.listdir(".")) if f.endswith(".tar.gz")}}
+          json.dump(parts, open("parts-php-$PHP-macos-${{ matrix.chip }}.json", "w"), indent=1)
+          print(json.dumps(parts, indent=1))
+          PY
+          zip -qr LICENSES-php-$PHP-${{ matrix.chip }}.zip LICENSES && rm -r LICENSES
+          shasum -a 256 *.tar.gz > SHA256SUMS-php-$PHP-macos-${{ matrix.chip }}.txt; cat SHA256SUMS-*.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: 'php-${{ matrix.chip }}', path: out/ }
+  publish:
+    if: startsWith(github.ref, 'refs/tags/php-')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: got, merge-multiple: true }
+      - name: Publish the release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release create "$GITHUB_REF_NAME" got/* --repo "$GITHUB_REPOSITORY" --title "PHP ${{ env.PHP }} (${{ github.ref_name }})" --notes "PHP ${{ env.PHP }} (the php command) for Apple Silicon and Intel Macs, compiled here from php.net's source, with only what Rushes uses. What went in is in the parts-*.json files, and the fingerprints in SHA256SUMS-*.txt."
