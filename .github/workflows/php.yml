@@ -36,7 +36,8 @@ jobs:
       - name: PHP's source, from php.net, checked against the fingerprint php.net publishes
         env: { GITHUB_TOKEN: '${{ github.token }}' }
         run: |
-          ./spc download --with-php=$PHP --for-extensions="$EXT" --prefer-pre-built
+          # every library from its own source, compiled here: none taken ready-made (no --prefer-pre-built)
+          ./spc download --with-php=$PHP --for-extensions="$EXT"
           ls -la downloads | head -40
           src=$(ls downloads/php-$PHP.tar.* | head -1); test -n "$src"
           have=$(shasum -a 256 "$src" | cut -d' ' -f1)
@@ -60,6 +61,7 @@ jobs:
                  echo password_verify("x", password_hash("x", PASSWORD_DEFAULT)) ? "password ok\n" : exit(1); echo filter_var("a@b.org", FILTER_VALIDATE_EMAIL) ? "filter ok\n" : exit(1);
                  echo preg_match("/(*UCP)\\bniño\\b/u", "un niño") ? "words in every alphabet ok\n" : exit(1);'
           $P -i > php-info.txt
+          awk '/^zip$/,/^zlib$/' php-info.txt; ls source
           # Rushes' own checks, on this PHP: its pages, the Viewer's agreement with Search, pulls and requests, pairing
           git clone -q --depth 1 --branch $RUSHES https://github.com/x0on/rushes
           cd rushes/tests && export PHPBIN=$P PATH="$(dirname $P):$PATH"
@@ -74,9 +76,9 @@ jobs:
           mkdir -p out/LICENSES && cd out
           cp ../buildroot/bin/php php && codesign -s - -f php && tar czf php-$PHP-cli-macos-${{ matrix.spc }}.tar.gz php && rm php
           cp ../php-info.txt php-$PHP-macos-${{ matrix.chip }}-info.txt
-          ./../spc dump-license --for-extensions="$EXT" --dump-dir=LICENSES --without-php 2>/dev/null || true
-          cp ../source/php-src/LICENSE LICENSES/PHP.txt 2>/dev/null || true
-          ls LICENSES
+          (cd .. && ./spc dump-license --for-extensions="$EXT" --dump-dir=out/LICENSES) || echo "spc did not write the licenses"
+          cp ../source/php-src/LICENSE LICENSES/PHP.txt
+          ls -la LICENSES; test -s LICENSES/PHP.txt
           python3 - <<PY
           import json, hashlib, os, re
           sha = lambda f: hashlib.sha256(open(f, "rb").read()).hexdigest()
@@ -88,7 +90,8 @@ jobs:
                    "parts": [{"name": "PHP", "version": "$PHP", "license": "PHP-3.01", "url": "https://www.php.net/distributions/", "sha256": open("../source.sha256").read().split()[0]},
                              {"name": "static-php-cli", "version": "$SPC", "license": "MIT", "url": "https://github.com/crazywhalecc/static-php-cli", "sha256": open("../spc.sha256").read().split()[0], "note": "the tool that compiled it"}]
                             + [{"name": n, "version": ver, "license": lic, "inside": "PHP"} for n, ver, lic in libs if ver],
-                   "sources": sorted(os.listdir("../downloads")),
+                   "sources": sorted(f for f in os.listdir("../downloads") if not f.startswith(".")),      # everything fetched to compile it, as named by its project
+                   "compiled_from": sorted(os.listdir("../source")),
                    "files": {f: sha(f) for f in sorted(os.listdir(".")) if f.endswith(".tar.gz")}}
           json.dump(parts, open("parts-php-$PHP-macos-${{ matrix.chip }}.json", "w"), indent=1)
           print(json.dumps(parts, indent=1))
