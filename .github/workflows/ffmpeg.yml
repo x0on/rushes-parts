@@ -1,0 +1,106 @@
+# FFmpeg and ffprobe for the Mac, from FFmpeg's own signed source. See README.md.
+name: ffmpeg
+on:
+  push:
+    tags: ['ffmpeg-*']
+    branches: ['try-ffmpeg*']       # a trial: built and tested, kept as an artifact, not published
+  workflow_dispatch:
+permissions:
+  contents: write                   # to publish the release a tag asks for
+env:
+  FFMPEG: '9.1'
+  # FFmpeg's release signing key. The source is used only if this key signed it.
+  FFMPEG_KEY: FCF986EA15E6E293A5644F10B4322F04D67658D8
+  OPENH264: v2.7.0
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { chip: arm64,  runner: macos-14, target: '11.0' }
+          - { chip: x86_64, runner: macos-13, target: '10.15' }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: What compiling needs
+        run: brew install nasm pkg-config gnupg
+      - name: FFmpeg's source, and its signature
+        run: |
+          curl -fsSLO https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz
+          curl -fsSLO https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz.asc
+          curl -fsSL https://ffmpeg.org/ffmpeg-devel.asc | gpg --import
+          gpg --list-keys --with-colons | grep -q "fpr:::::::::$FFMPEG_KEY:" || { echo "the key ffmpeg.org gave is not FFmpeg's release key"; exit 1; }
+          gpg --status-fd 1 --verify ffmpeg-$FFMPEG.tar.xz.asc ffmpeg-$FFMPEG.tar.xz | tee verify.txt
+          grep -q "VALIDSIG $FFMPEG_KEY" verify.txt || { echo "not signed by FFmpeg's release key: not used"; exit 1; }
+          shasum -a 256 ffmpeg-$FFMPEG.tar.xz | tee source.sha256
+          tar xf ffmpeg-$FFMPEG.tar.xz
+      - name: OpenH264 (the H.264 encoder used when the Mac's video chip cannot be)
+        run: |
+          git clone -q --depth 1 --branch $OPENH264 https://github.com/cisco/openh264
+          git -C openh264 rev-parse HEAD | tee openh264.commit
+          make -C openh264 -j4 PREFIX=$PWD/dist install-static
+      - name: Compile FFmpeg
+        run: |
+          cd ffmpeg-$FFMPEG
+          PKG_CONFIG_PATH=$PWD/../dist/lib/pkgconfig ./configure --prefix=$PWD/../dist \
+            --disable-autodetect --enable-videotoolbox --enable-audiotoolbox --enable-zlib --enable-libopenh264 \
+            --enable-static --disable-shared --disable-doc --disable-ffplay --disable-debug \
+            --pkg-config-flags=--static --extra-ldflags="-L$PWD/../dist/lib" --extra-cflags="-I$PWD/../dist/include" \
+            --extra-version=rushes-parts
+          make -j4
+          make install
+      - name: Does it do what Rushes asks of it?
+        run: |
+          F=dist/bin/ffmpeg; P=dist/bin/ffprobe
+          $F -version | head -3
+          $F -hide_banner -L 2>&1 | head -4
+          $F -version | grep -q -- "--enable-gpl" && { echo "a GPL part got in"; exit 1; }
+          otool -L $F | tee libs.txt; grep -v "/usr/lib/\|/System/Library/\|ffmpeg:" libs.txt | grep . && { echo "it needs a library the Mac does not have"; exit 1; }
+          h=720; fit="scale='if(gt(iw,ih),-2,2*trunc(min($h,iw)/2))':'if(gt(iw,ih),2*trunc(min($h,ih)/2),-2)'"
+          $F -nostdin -loglevel error -y -f lavfi -i testsrc2=s=1920x1080:d=3:r=30 -f lavfi -i sine=d=3 -c:v libopenh264 -c:a aac src.mov
+          $F -nostdin -loglevel error -y -f lavfi -i testsrc2=s=1080x1920:d=2 -c:v libopenh264 vertical.mp4
+          $F -nostdin -loglevel error -y -i src.mov -vf "$fit" -c:v libopenh264 -b:v 4M -c:a aac -b:a 128k -movflags +faststart soft.mp4
+          test "$($P -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 soft.mp4)" = "1280,720"
+          $F -nostdin -loglevel error -y -i vertical.mp4 -vf "$fit" -c:v libopenh264 -b:v 4M v.mp4
+          test "$($P -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 v.mp4)" = "720,1280"
+          # the Mac's video chip, as Rushes uses it first (a runner may have none: said, not failed)
+          $F -nostdin -loglevel error -y -hwaccel videotoolbox -i src.mov -vf "$fit" -c:v h264_videotoolbox -b:v 4M -maxrate 6M -c:a aac -b:a 128k -movflags +faststart chip.mp4 \
+            && echo "video chip: works" || echo "video chip: not on this runner"
+          $F -nostdin -loglevel error -ss 1.500 -i src.mov -frames:v 1 -vf scale=480:-2 -q:v 4 -y still.jpg; test -s still.jpg
+          $P -v error -show_entries format=duration:format_tags=creation_time:stream=codec_type -of json src.mov | grep -q '"duration"'
+          for d in prores dnxhd mpeg2video h264 hevc mjpeg png pcm_s24le aac mp3; do $F -hide_banner -decoders | grep -q " $d " || { echo "cannot read $d"; exit 1; }; done
+          for m in mov mxf mpegts avi matroska; do $F -hide_banner -demuxers | grep -q "$m" || { echo "cannot open $m"; exit 1; }; done
+      - name: Pack it, with its fingerprints, its licenses and what went into it
+        run: |
+          mkdir -p out/LICENSES && cd out
+          for n in ffmpeg ffprobe; do cp ../dist/bin/$n . && strip $n && codesign -s - -f $n && zip -q $n-$FFMPEG-macos-${{ matrix.chip }}.zip $n && rm $n; done
+          cp ../ffmpeg-$FFMPEG/COPYING.LGPLv2.1 LICENSES/FFmpeg.txt; cp ../ffmpeg-$FFMPEG/LICENSE.md LICENSES/FFmpeg-LICENSE.md; cp ../openh264/LICENSE LICENSES/OpenH264.txt
+          python3 - <<PY
+          import json, hashlib, os
+          sha = lambda f: hashlib.sha256(open(f, "rb").read()).hexdigest()
+          parts = {"made": "FFmpeg $FFMPEG for macOS ${{ matrix.chip }}, by github.com/x0on/rushes-parts (${{ github.sha }})", "license": "LGPL-2.1-or-later",
+                   "parts": [{"name": "FFmpeg", "version": "$FFMPEG", "license": "LGPL-2.1-or-later", "url": "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz",
+                              "sha256": open("../source.sha256").read().split()[0], "signed_by": "$FFMPEG_KEY"},
+                             {"name": "OpenH264", "version": "$OPENH264", "license": "BSD-2-Clause", "url": "https://github.com/cisco/openh264", "commit": open("../openh264.commit").read().strip()},
+                             {"name": "zlib, VideoToolbox, AudioToolbox", "version": "the Mac's own", "license": "part of macOS", "url": "https://developer.apple.com/"}],
+                   "files": {f: sha(f) for f in sorted(os.listdir(".")) if f.endswith(".zip")}}
+          json.dump(parts, open("parts-ffmpeg-$FFMPEG-macos-${{ matrix.chip }}.json", "w"), indent=1)
+          PY
+          zip -qr LICENSES-ffmpeg-$FFMPEG.zip LICENSES && rm -r LICENSES
+          shasum -a 256 *.zip > SHA256SUMS-ffmpeg-$FFMPEG-macos-${{ matrix.chip }}.txt; cat SHA256SUMS-*.txt
+      - uses: actions/upload-artifact@v4
+        with: { name: 'ffmpeg-${{ matrix.chip }}', path: out/ }
+  publish:
+    if: startsWith(github.ref, 'refs/tags/ffmpeg-')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: got, merge-multiple: true }
+      - name: Publish the release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: gh release create "$GITHUB_REF_NAME" got/* --repo "$GITHUB_REPOSITORY" --title "FFmpeg ${{ env.FFMPEG }} (${{ github.ref_name }})" --notes "FFmpeg ${{ env.FFMPEG }} and ffprobe for Apple Silicon and Intel Macs, compiled here from FFmpeg's signed source. LGPL-2.1-or-later; no GPL part. What went in: the parts-*.json files. Fingerprints: SHA256SUMS-*.txt."
